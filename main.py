@@ -1,53 +1,52 @@
 # main.py
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from intent_classifier import detect_intent
 from prompt_templates import PROMPTS
-from transformers import pipeline
+from memory import get_session, save_message
+import requests, re
 
-app = FastAPI(title="MofaAI v0.0.1")
-
-# Load lightweight local LLM (replace with Ollama/API later)
-llm = pipeline("text-generation", model="Qwen/Qwen2.5-0.5B-Instruct")
+app = FastAPI(title="MofaAI v0.2.0")
+OLLAMA_URL = "http://localhost:11434/api/chat"
+MODEL_NAME = "qwen2.5:1.5b"
 
 class QueryRequest(BaseModel):
     query: str
+    session_id: str = "default"
 
 class QueryResponse(BaseModel):
     intent: str
     response: str
+    reasoning_trace: str | None = None
     confidence_note: str | None = None
-    reasoning_trace: str | None = None  # ← Add this
+    session_id: str
+
+def call_ollama(messages: list) -> str:
+    res = requests.post(OLLAMA_URL, json={"model": MODEL_NAME, "messages": messages, "stream": False}, timeout=90)
+    res.raise_for_status()
+    return res.json()["message"]["content"].strip()
 
 @app.post("/ask", response_model=QueryResponse)
-async def ask(request: QueryRequest):
-    # 1. Detect intent
-    intent = detect_intent(request.query)
-    
-    # 2. Build adaptive prompt WITH reasoning instruction
-    prompt_template = PROMPTS.get(intent, PROMPTS["general"])
-    full_prompt = f"""Think step-by-step. Then answer.
-If uncertain, explicitly say what's missing and ask a clarifying question.
-
-{prompt_template.format(query=request.query)}"""
-    
-    # 3. Generate response
-    result = llm(full_prompt, max_new_tokens=300, do_sample=True, temperature=0.3)[0]['generated_text']
-    answer = result.replace(full_prompt, "").strip()
-    
-    # 4. Enhanced absence-aware flagging
-    uncertainty_keywords = ["not sure", "uncertain", "might be", "could be", "i don't know", "lack information", "need more context", "unable to determine"]
-    confidence_note = None
-    if any(kw in answer.lower() for kw in uncertainty_keywords):
-        confidence_note = "⚠️ MofaAI flagged uncertainty — verify critical info"
-    
-    # 5. Extract simple reasoning trace (first 2 sentences)
-    sentences = answer.split('. ')
-    reasoning_trace = '. '.join(sentences[:2]) + '.' if len(sentences) > 2 else None
-    
-    return QueryResponse(
-        intent=intent,
-        response=answer,
-        confidence_note=confidence_note
-        # We'll add reasoning_trace to the model next
-    )
+async def ask(req: QueryRequest):
+    try:
+        intent = detect_intent(req.query)
+        history = get_session(req.session_id)
+        context = "\n".join(history) if history else "No prior context."
+        
+        sys_prompt = f"You are MofaAI. Intent: {intent.upper()}. Context: {context}. Be concise. Flag uncertainty clearly."
+        messages = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": req.query}]
+        
+        raw = call_ollama(messages)
+        sentences = re.split(r'(?<=[.!?]) +', raw)
+        reasoning_trace = sentences[0] if len(sentences) > 1 else None
+        response = " ".join(sentences[1:]) if len(sentences) > 1 else raw
+        
+        uncertain_kw = ["not sure", "uncertain", "might be", "could be", "i don't know", "lack data"]
+        confidence_note = "️ Low confidence - verify critical info" if any(k in raw.lower() for k in uncertain_kw) else None
+        
+        save_message(req.session_id, "user", req.query)
+        save_message(req.session_id, "assistant", response)
+        
+        return QueryResponse(intent=intent, response=response, reasoning_trace=reasoning_trace, confidence_note=confidence_note, session_id=req.session_id)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=str(e))
